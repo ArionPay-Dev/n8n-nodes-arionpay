@@ -5,6 +5,11 @@
   "keywords": ["n8n-community-node-package", "arionpay", "crypto", "bitcoin", "usdt", "payments"],
   "license": "MIT",
   "homepage": "https://arionpay.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ArionPay-Dev/n8n-nodes-arionpay.git"
+  },
+  "bugs": "https://github.com/ArionPay-Dev/n8n-nodes-arionpay/issues",
   "author": { "name": "ArionPay", "url": "https://arionpay.com" },
   "main": "index.js",
   "files": ["dist"],
