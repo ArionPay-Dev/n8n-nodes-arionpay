@@ -10,7 +10,7 @@ export interface ArionPayCredentials {
 }
 
 export const DEFAULT_BASE_URL = 'https://merchant.arionpay.com';
-export const VERSION = '1.0.0';
+export const VERSION = '1.0.1';
 export const EVENT_TYPES = ['invoice.pending', 'invoice.partial', 'invoice.paid', 'invoice.expired', 'invoice.needs_review'];
 export const FIAT_CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'TRY', 'AED', 'INR', 'BRL', 'RUB', 'CNY', 'SGD', 'HKD', 'KRW', 'MXN', 'PLN', 'SEK', 'NOK', 'ZAR'];
 const TOLERANCE_SEC = 300;

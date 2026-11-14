@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-arionpay",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "ArionPay crypto payments for n8n: create invoices, read them, and start workflows when a payment arrives (signed webhooks). Money goes straight to your own wallet.",
   "keywords": ["n8n-community-node-package", "arionpay", "crypto", "bitcoin", "usdt", "payments"],
   "license": "MIT",
