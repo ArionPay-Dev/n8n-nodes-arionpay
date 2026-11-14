@@ -1,0 +1,71 @@
+name: Publish to npm
+
+# Every push and pull request installs, builds and tests the package and packs the tarball.
+# Only a published GitHub release (or a manual run) publishes that tarball to npm,
+# through npm trusted publishing: no npm token is stored anywhere, and npm adds a
+# provenance statement linking the package to this repository and workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - run: npm ci --no-audit --no-fund --ignore-scripts
+      - run: npm run build --if-present
+      - run: npm test
+      - name: Release tag must match the package version
+        if: github.event_name == 'release'
+        run: |
+          version=$(node -p "require('./package.json').version")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
+      - name: Pack
+        run: |
+          mkdir -p out
+          npm pack --pack-destination out
+          ls -l out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tarball
+          path: out/*.tgz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/n8n-nodes-arionpay
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tarball
+          path: out
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: npm 11.15 or newer (trusted publishing)
+        run: |
+          npm install -g npm@11
+          npm --version
+      - name: Publish
+        run: npm publish ./out/*.tgz --access public
