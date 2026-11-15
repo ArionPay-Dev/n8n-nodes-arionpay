@@ -64,6 +64,55 @@ test("base URL with a path keeps the path in the signed request", async () => {
   assert.equal(seen.url, "https://h/prefix/api/v1/rates?currency=EUR");
 });
 
+const creds = { apiKey: " pk_test_abcdefgh ", apiSecret: " sk_x ", baseUrl: "https://h/prefix/" };
+const hmac = (data) => createHmac("sha256", "sk_x").update(data).digest("hex");
+
+test("n8n-sent requests: GET with baseURL and qs signs the final path and query", () => {
+  const r = g.signN8nRequest(creds, { baseURL: "https://h/prefix/", url: "/api/v1/store", method: "GET", qs: { a: "1 2", b: ["x", "y"] }, headers: { Accept: "application/json" } }, 100);
+  assert.equal(r.url, "https://h/prefix/api/v1/store?a=1+2&b=x&b=y");
+  assert.equal(r.baseURL, undefined);
+  assert.equal(r.qs, undefined);
+  assert.equal(r.headers.Accept, "application/json");
+  assert.equal(r.headers["x-api-key"], "pk_test_abcdefgh");
+  assert.equal(r.headers["x-timestamp"], "100");
+  assert.equal(r.headers["x-signature"], hmac("100.GET /prefix/api/v1/store?a=1+2&b=x&b=y"));
+});
+
+test("n8n-sent requests: relative URL without baseURL uses the credential address; absolute URL is kept", () => {
+  assert.equal(g.signN8nRequest({ ...creds, baseUrl: "" }, { url: "api/v1/store" }, 1).url, "https://merchant.arionpay.com/api/v1/store");
+  const r = g.signN8nRequest(creds, { url: "https://other.example/api/v1/invoices/abc", method: "GET" }, 7);
+  assert.equal(r.url, "https://other.example/api/v1/invoices/abc");
+  assert.equal(r.headers["x-signature"], hmac("7.GET /api/v1/invoices/abc"));
+});
+
+test("n8n-sent requests: an object body is sent as the exact JSON string that was signed", () => {
+  const r = g.signN8nRequest(creds, { url: "https://h/api/v1/invoices", method: "POST", body: { amount: "5", currency: "USD" }, headers: {} }, 9);
+  assert.equal(r.body, '{"amount":"5","currency":"USD"}');
+  assert.equal(r.headers["Content-Type"], "application/json");
+  assert.equal(r.headers["x-signature"], hmac('9.{"amount":"5","currency":"USD"}'));
+  const s = g.signN8nRequest(creds, { uri: "https://h/api/v1/webhooks/test", method: "post", body: '{"eventType":"invoice.paid"}', headers: { "content-type": "application/json" } }, 9);
+  assert.equal(s.uri, "https://h/api/v1/webhooks/test");
+  assert.equal(s.headers["Content-Type"], undefined);
+  assert.equal(s.headers["x-signature"], hmac('9.{"eventType":"invoice.paid"}'));
+});
+
+test("verified events: filter by type, test events and live/test mode; output shape", () => {
+  const paid = { id: "evt_2", type: "invoice.paid", created: 5, livemode: true, data: { invoice: { id: "b".repeat(24), test: false } } };
+  const testInv = { ...paid, id: "evt_3", livemode: false, data: { invoice: { id: "c".repeat(24), test: true } } };
+  const sample = { id: "evt_test_1", type: "invoice.paid", test: true, data: { invoice: { id: "inv_test_1", test: true } } };
+  assert.equal(g.skipReason(paid, { events: ["invoice.paid"] }), null);
+  assert.equal(g.skipReason(paid, { events: ["invoice.expired"] }), "event not selected");
+  assert.equal(g.skipReason({ ...paid, type: "invoice.unknown" }, { events: ["invoice.unknown"] }), "event type");
+  assert.equal(g.skipReason(sample, { events: ["invoice.paid"] }), "test event");
+  assert.equal(g.skipReason(sample, { events: ["invoice.paid"], includeTestEvents: true }), null);
+  assert.equal(g.skipReason(testInv, { events: ["invoice.paid"], mode: "live" }), "test/live mode");
+  assert.equal(g.skipReason(paid, { events: ["invoice.paid"], mode: "test" }), "test/live mode");
+  assert.equal(g.skipReason(testInv, { events: ["invoice.paid"], mode: "test" }), null);
+  assert.deepEqual(g.eventOutput(paid), { eventId: "evt_2", type: "invoice.paid", created: 5, livemode: true, sampleEvent: false, invoice: paid.data.invoice });
+  assert.equal(g.eventOutput(sample).sampleEvent, true);
+  assert.equal(g.eventOutput({ ...testInv, livemode: undefined }).livemode, false);
+});
+
 const BASE = process.env.ARIONPAY_TEST_BASE_URL;
 test("live: create, read and simulate against an ArionPay test server", { skip: !BASE }, async () => {
   const creds = { apiKey: process.env.ARIONPAY_TEST_KEY, apiSecret: process.env.ARIONPAY_TEST_SECRET, baseUrl: BASE };

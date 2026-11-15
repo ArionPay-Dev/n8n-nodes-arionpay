@@ -1,5 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
-import type { IDataObject } from 'n8n-workflow';
+import type { IDataObject, IHttpRequestOptions } from 'n8n-workflow';
+import { sleep } from 'n8n-workflow';
 
 /** Credentials as stored in n8n (credentials/ArionPayApi.credentials.ts). */
 export interface ArionPayCredentials {
@@ -10,7 +11,7 @@ export interface ArionPayCredentials {
 }
 
 export const DEFAULT_BASE_URL = 'https://merchant.arionpay.com';
-export const VERSION = '1.0.1';
+export const VERSION = '2.0.0';
 export const EVENT_TYPES = ['invoice.pending', 'invoice.partial', 'invoice.paid', 'invoice.expired', 'invoice.needs_review'];
 export const FIAT_CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'TRY', 'AED', 'INR', 'BRL', 'RUB', 'CNY', 'SGD', 'HKD', 'KRW', 'MXN', 'PLN', 'SEK', 'NOK', 'ZAR'];
 const TOLERANCE_SEC = 300;
@@ -78,17 +79,20 @@ export async function apiRequest(
 			headers['x-timestamp'] = String(ts);
 			headers['x-signature'] = signRequest(apiSecret, ts, method, url.pathname + url.search, raw ?? '');
 		}
-		let res: { status: number; body: unknown };
+		// A network failure is reported as an ArionPayApiError with status 0; the node turns it into a NodeOperationError.
+		let res: { status: number; body: unknown } | undefined;
+		let failure = '';
 		try {
 			res = await send({ method, url: url.toString(), headers, body: raw });
 		} catch (e) {
-			throw new ArionPayApiError(`Could not reach ArionPay: ${(e as Error)?.message ?? e}`, 0);
+			failure = String((e as Error)?.message ?? e);
 		}
+		if (!res) throw new ArionPayApiError(`Could not reach ArionPay: ${failure}`, 0);
 		const data = decode(res.body);
 		if (res.status >= 200 && res.status < 300) return data;
 		const message = typeof data.error === 'string' ? data.error : typeof data.message === 'string' ? data.message : `HTTP ${res.status}`;
 		if (res.status === 401 && /already used/i.test(message) && attempt === 1) {
-			await new Promise((r) => setTimeout(r, 1100)); // two identical signed requests in one second: sign again
+			await sleep(1100); // two identical signed requests in one second: sign again
 			continue;
 		}
 		throw new ArionPayApiError(`ArionPay API error (${res.status}): ${message}`, res.status, data);
@@ -178,4 +182,74 @@ export function verifyWebhook(raw: Buffer, header: string, secret: string, now =
 export function isTestEvent(event: IDataObject): boolean {
 	const inv = ((event.data as IDataObject)?.invoice ?? {}) as IDataObject;
 	return Boolean(event.test) || String(event.id).startsWith('evt_test_') || String(inv.id ?? '').startsWith('inv_test_');
+}
+
+export interface EventFilter {
+	/** Event types to pass on, e.g. ['invoice.paid']. */
+	events: string[];
+	/** Also pass on "Send test webhook" sample events (made-up invoice). */
+	includeTestEvents?: boolean;
+	/** 'live' = only real-money invoices, 'test' = only test invoices, 'both' (default). */
+	mode?: string;
+}
+
+/** Why a verified event is not passed on, or null when it is wanted. */
+export function skipReason(event: IDataObject, filter: EventFilter): string | null {
+	const invoice = ((event.data as IDataObject)?.invoice ?? {}) as IDataObject;
+	const sample = isTestEvent(event);
+	const type = String(event.type);
+	if (sample && !filter.includeTestEvents) return 'test event';
+	if (!EVENT_TYPES.includes(type)) return 'event type';
+	if (!filter.events.includes(type)) return 'event not selected';
+	const mode = String(filter.mode ?? 'both');
+	if ((mode === 'live' && invoice.test === true) || (mode === 'test' && invoice.test !== true)) return 'test/live mode';
+	return null;
+}
+
+/** The verified event in the shape the workflow gets. */
+export function eventOutput(event: IDataObject): IDataObject {
+	const invoice = ((event.data as IDataObject)?.invoice ?? {}) as IDataObject;
+	return {
+		eventId: event.id,
+		type: event.type,
+		created: event.created ?? null,
+		livemode: event.livemode ?? !invoice.test,
+		sampleEvent: isTestEvent(event),
+		invoice,
+	};
+}
+
+/**
+ * Signs a request that n8n sends with these credentials (the credential test, or the HTTP Request node with
+ * "ArionPay API" credentials). The query is moved into the URL and an object body is sent as the exact JSON
+ * string that was signed, so what ArionPay receives is what was signed. The API secret itself is never sent.
+ */
+export function signN8nRequest(creds: ArionPayCredentials, options: IHttpRequestOptions, now = Math.floor(Date.now() / 1000)): IHttpRequestOptions {
+	const legacy = options as IHttpRequestOptions & { uri?: string };
+	const target = String(options.url || legacy.uri || '');
+	const url = /^https?:\/\//i.test(target)
+		? new URL(target)
+		: new URL(`${(String(options.baseURL || creds.baseUrl || '').trim() || DEFAULT_BASE_URL).replace(/\/+$/, '')}/${target.replace(/^\/+/, '')}`);
+	for (const [key, value] of Object.entries((options.qs ?? {}) as IDataObject)) {
+		if (value === undefined || value === null) continue;
+		for (const one of Array.isArray(value) ? value : [value]) url.searchParams.append(key, typeof one === 'object' ? JSON.stringify(one) : String(one));
+	}
+	const method = String(options.method ?? 'GET').toUpperCase();
+	const headers: IDataObject = { ...(options.headers ?? {}) };
+	const signed: IHttpRequestOptions & { uri?: string } = { ...options, headers };
+	delete signed.qs;
+	delete signed.baseURL;
+	signed.url = url.toString();
+	if (legacy.uri !== undefined) signed.uri = url.toString();
+	let raw = '';
+	if (method !== 'GET' && method !== 'HEAD' && options.body !== undefined && options.body !== null && options.body !== '') {
+		const b = options.body as unknown;
+		raw = typeof b === 'string' ? b : Buffer.isBuffer(b) ? b.toString('utf8') : JSON.stringify(b);
+		signed.body = raw;
+		if (!Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) headers['Content-Type'] = 'application/json';
+	}
+	headers['x-api-key'] = String(creds.apiKey ?? '').trim();
+	headers['x-timestamp'] = String(now);
+	headers['x-signature'] = signRequest(String(creds.apiSecret ?? '').trim(), now, method, url.pathname + url.search, raw);
+	return signed;
 }

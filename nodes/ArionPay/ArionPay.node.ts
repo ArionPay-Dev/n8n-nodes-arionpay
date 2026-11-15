@@ -1,23 +1,22 @@
 import type {
-	ICredentialDataDecryptedObject,
-	ICredentialsDecrypted,
-	ICredentialTestFunctions,
 	IDataObject,
 	IExecuteFunctions,
-	INodeCredentialTestResult,
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
-	NodeConnectionType,
+	JsonObject,
 } from 'n8n-workflow';
-import { NodeOperationError } from 'n8n-workflow';
+import { NodeApiError, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 import {
 	apiRequest,
 	ArionPayApiError,
+	eventOutput,
 	FIAT_CURRENCIES,
 	newIdempotencyKey,
 	normalizeCreated,
 	normalizeInvoiceRead,
+	skipReason,
+	verifyWebhook,
 	type ArionPayCredentials,
 	type Transport,
 } from './GenericFunctions';
@@ -43,19 +42,23 @@ const EVENT_OPTIONS = [
 
 const isInvoiceId = (id: string) => /^[0-9a-fA-F]{24}$/.test(id);
 
+const MAX_BODY_BYTES = 262144;
+const REMEMBERED_EVENTS = 300;
+
 export class ArionPay implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'ArionPay',
 		name: 'arionPay',
-		icon: 'file:arionpay.svg',
+		icon: { light: 'file:arionpay.svg', dark: 'file:arionpay.dark.svg' },
 		group: ['transform'],
 		version: 1,
 		subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
-		description: 'Crypto payments paid straight to your own wallet: create and read invoices',
+		description: 'Crypto payments paid straight to your own wallet: create and read invoices, check payment webhooks',
 		defaults: { name: 'ArionPay' },
-		inputs: ['main' as NodeConnectionType],
-		outputs: ['main' as NodeConnectionType],
-		credentials: [{ name: 'arionPayApi', required: true, testedBy: 'arionPayApiTest' }],
+		inputs: [NodeConnectionTypes.Main],
+		outputs: [NodeConnectionTypes.Main],
+		usableAsTool: true,
+		credentials: [{ name: 'arionPayApi', required: true }],
 		properties: [
 			{
 				displayName: 'Resource',
@@ -88,7 +91,15 @@ export class ArionPay implements INodeType {
 				type: 'options',
 				noDataExpression: true,
 				displayOptions: { show: { resource: ['webhook'] } },
-				options: [{ name: 'Send Test Event', value: 'sendTest', description: "Ask ArionPay to send a signed sample event to your store's webhook address", action: 'Send a test webhook event' }],
+				options: [
+					{ name: 'Send Test Event', value: 'sendTest', description: "Ask ArionPay to send a signed sample event to your store's webhook address", action: 'Send a test webhook event' },
+					{
+						name: 'Verify Webhook',
+						value: 'verify',
+						description: "Check the signature of a payment update that n8n's Webhook node received, and pass on the events you want",
+						action: 'Verify a webhook',
+					},
+				],
 				default: 'sendTest',
 			},
 			{
@@ -139,10 +150,7 @@ export class ArionPay implements INodeType {
 				default: {},
 				displayOptions: { show: { resource: ['invoice'], operation: ['create'] } },
 				options: [
-					{ displayName: 'Order ID', name: 'orderId', type: 'string', default: '', description: 'Your own order number, shown in ArionPay' },
-					{ displayName: 'Description', name: 'description', type: 'string', default: '' },
-					{ displayName: 'Success URL', name: 'successUrl', type: 'string', default: '', description: 'Where the customer goes after paying' },
-					{ displayName: 'Cancel URL', name: 'cancelUrl', type: 'string', default: '', description: 'Where the customer goes when they leave without paying' },
+					{ displayName: 'Allowed Coins', name: 'allowedAssets', type: 'string', default: '', placeholder: 'BTC, LTC, USDT_TRC20', description: 'Comma-separated list of coins the customer may choose' },
 					{
 						displayName: 'Callback URL',
 						name: 'callbackUrl',
@@ -150,10 +158,9 @@ export class ArionPay implements INodeType {
 						default: '',
 						description: 'Where ArionPay sends this invoice\'s payment updates, e.g. the Production URL of an ArionPay Trigger node',
 					},
+					{ displayName: 'Cancel URL', name: 'cancelUrl', type: 'string', default: '', description: 'Where the customer goes when they leave without paying' },
 					{ displayName: 'Coin', name: 'asset', type: 'string', default: '', placeholder: 'USDT_TRC20', description: 'Choose the coin for the customer (see Get Coins)' },
-					{ displayName: 'Allowed Coins', name: 'allowedAssets', type: 'string', default: '', placeholder: 'BTC, LTC, USDT_TRC20', description: 'Comma-separated list of coins the customer may choose' },
-					{ displayName: 'Time to Pay (Minutes)', name: 'expiresMin', type: 'number', default: 60, typeOptions: { minValue: 5, maxValue: 1440 } },
-					{ displayName: 'Metadata (JSON)', name: 'metadata', type: 'json', default: '{}', description: 'Your own data, sent back in every webhook for this invoice' },
+					{ displayName: 'Description', name: 'description', type: 'string', default: '' },
 					{
 						displayName: 'Idempotency Key',
 						name: 'idempotencyKey',
@@ -161,6 +168,10 @@ export class ArionPay implements INodeType {
 						default: '',
 						description: 'The same key always returns the same invoice, so a retried workflow never makes a second one. Use something like your order number.',
 					},
+					{ displayName: 'Metadata (JSON)', name: 'metadata', type: 'json', default: '{}', description: 'Your own data, sent back in every webhook for this invoice' },
+					{ displayName: 'Order ID', name: 'orderId', type: 'string', default: '', description: 'Your own order number, shown in ArionPay' },
+					{ displayName: 'Success URL', name: 'successUrl', type: 'string', default: '', description: 'Where the customer goes after paying' },
+					{ displayName: 'Time to Pay (Minutes)', name: 'expiresMin', type: 'number', default: 60, typeOptions: { minValue: 5, maxValue: 1440 } },
 				],
 			},
 
@@ -194,6 +205,78 @@ export class ArionPay implements INodeType {
 				displayOptions: { show: { resource: ['webhook'], operation: ['sendTest'] } },
 			},
 
+			// webhook: verify
+			{
+				displayName:
+					"Put this after n8n's Webhook node: HTTP Method POST, Respond 'When Last Node Finishes', Response Data 'No Response Body', and under Options switch on Raw Body. Paste the Webhook node's Production URL into ArionPay: dashboard > Webhooks, or the Callback URL of each invoice. The credentials need the webhook signing secret.",
+				name: 'verifyNotice',
+				type: 'notice',
+				default: '',
+				displayOptions: { show: { resource: ['webhook'], operation: ['verify'] } },
+			},
+			{
+				displayName: 'Events',
+				name: 'events',
+				type: 'multiOptions',
+				options: [
+					{ name: 'Invoice Expired', value: 'invoice.expired', description: 'Time to pay ran out without full payment' },
+					{ name: 'Invoice Needs Review', value: 'invoice.needs_review', description: 'Payment Radar: you decide in the dashboard' },
+					{ name: 'Invoice Paid', value: 'invoice.paid', description: 'Fully paid and confirmed (also late payments and payments you accepted in Payment Radar)' },
+					{ name: 'Invoice Partial', value: 'invoice.partial', description: 'Part of the amount was paid' },
+					{ name: 'Invoice Pending', value: 'invoice.pending', description: 'Payment seen, waiting for network confirmations' },
+				],
+				default: ['invoice.paid'],
+				required: true,
+				description: 'Events that are passed on. Other verified events end the workflow quietly (ArionPay still gets its answer).',
+				displayOptions: { show: { resource: ['webhook'], operation: ['verify'] } },
+			},
+			{
+				displayName: 'Raw Body Field',
+				name: 'binaryPropertyName',
+				type: 'string',
+				default: 'data',
+				required: true,
+				description: "The binary field holding the exact body ArionPay sent. The Webhook node puts it in 'data' when Raw Body is on.",
+				displayOptions: { show: { resource: ['webhook'], operation: ['verify'] } },
+			},
+			{
+				displayName: 'Signature Header',
+				name: 'signatureHeader',
+				type: 'string',
+				default: '={{ $json.headers["arionpay-signature"] }}',
+				required: true,
+				description: 'The ArionPay-Signature header of the request',
+				displayOptions: { show: { resource: ['webhook'], operation: ['verify'] } },
+			},
+			{
+				displayName: 'Options',
+				name: 'verifyOptions',
+				type: 'collection',
+				placeholder: 'Add Option',
+				default: {},
+				displayOptions: { show: { resource: ['webhook'], operation: ['verify'] } },
+				options: [
+					{
+						displayName: 'Include "Send Test Webhook" Events',
+						name: 'includeTestEvents',
+						type: 'boolean',
+						default: false,
+						description: 'Whether to also pass on the sample events of the dashboard button. They describe a made-up invoice: never deliver anything for them.',
+					},
+					{
+						displayName: 'Only Test or Only Live Invoices',
+						name: 'mode',
+						type: 'options',
+						options: [
+							{ name: 'Both', value: 'both' },
+							{ name: 'Only Live (Real Money)', value: 'live' },
+							{ name: 'Only Test', value: 'test' },
+						],
+						default: 'both',
+					},
+				],
+			},
+
 			// info: rates
 			{
 				displayName: 'Currency',
@@ -204,34 +287,6 @@ export class ArionPay implements INodeType {
 				displayOptions: { show: { resource: ['info'], operation: ['rates'] } },
 			},
 		],
-	};
-
-	methods = {
-		credentialTest: {
-			async arionPayApiTest(this: ICredentialTestFunctions, credential: ICredentialsDecrypted): Promise<INodeCredentialTestResult> {
-				const creds = (credential.data ?? {}) as ICredentialDataDecryptedObject as unknown as ArionPayCredentials;
-				const send: Transport = async (req) => {
-					const res = await this.helpers.request({
-						method: req.method,
-						uri: req.url,
-						headers: req.headers,
-						body: req.body,
-						resolveWithFullResponse: true,
-						simple: false,
-						json: false,
-					});
-					return { status: Number(res.statusCode), body: res.body };
-				};
-				try {
-					// A signed read of an invoice that cannot exist: "not found" means the keys were accepted.
-					await apiRequest(send, creds, 'GET', '/api/v1/invoices/000000000000000000000000');
-					return { status: 'OK', message: 'Connection successful' };
-				} catch (e) {
-					if (e instanceof ArionPayApiError && e.status === 404) return { status: 'OK', message: 'Connection successful' };
-					return { status: 'Error', message: (e as Error).message };
-				}
-			},
-		},
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
@@ -299,6 +354,32 @@ export class ArionPay implements INodeType {
 						const scenario = this.getNodeParameter('scenario', i) as string;
 						result = await apiRequest(send, creds, 'POST', `/api/v1/invoices/${id}/simulate`, { scenario });
 					}
+				} else if (resource === 'webhook' && operation === 'verify') {
+					const secret = String(creds.webhookSecret ?? '').trim();
+					if (!secret) throw new NodeOperationError(this.getNode(), 'The webhook signing secret is empty in the ArionPay credentials (dashboard > Webhooks > signing secret).', { itemIndex: i });
+					const field = String(this.getNodeParameter('binaryPropertyName', i, 'data')).trim() || 'data';
+					if (!items[i].binary?.[field]) {
+						throw new NodeOperationError(this.getNode(), `No raw body in the binary field "${field}". In the Webhook node, switch on Options > Raw Body.`, { itemIndex: i });
+					}
+					// The signature covers the exact bytes ArionPay sent, never a re-serialised object.
+					const raw = await this.helpers.getBinaryDataBuffer(i, field);
+					if (raw.length > MAX_BODY_BYTES) throw new NodeOperationError(this.getNode(), 'The webhook body is too large to be from ArionPay.', { itemIndex: i });
+					const header = String(this.getNodeParameter('signatureHeader', i, '') ?? '');
+					const { event, error } = verifyWebhook(raw, header, secret);
+					if (!event) throw new NodeOperationError(this.getNode(), `Not a valid ArionPay webhook: ${error}`, { itemIndex: i });
+					const opts = this.getNodeParameter('verifyOptions', i, {}) as IDataObject;
+					const skip = skipReason(event, {
+						events: this.getNodeParameter('events', i, []) as string[],
+						includeTestEvents: opts.includeTestEvents === true,
+						mode: String(opts.mode ?? 'both'),
+					});
+					if (skip) continue;
+					// ArionPay delivers again when an answer is lost: pass each event on once (active workflows remember the last ids).
+					const store = this.getWorkflowStaticData('node') as { seen?: string[] };
+					const seen = Array.isArray(store.seen) ? store.seen : [];
+					if (seen.includes(String(event.id))) continue;
+					store.seen = [...seen, String(event.id)].slice(-REMEMBERED_EVENTS);
+					result = eventOutput(event);
 				} else if (resource === 'webhook' && operation === 'sendTest') {
 					result = await apiRequest(send, creds, 'POST', '/api/v1/webhooks/test', { eventType: this.getNodeParameter('eventType', i) as string });
 				} else if (resource === 'info' && operation === 'currencies') {
@@ -317,8 +398,12 @@ export class ArionPay implements INodeType {
 					out.push({ json: { error: (error as Error).message }, pairedItem: { item: i } });
 					continue;
 				}
-				if (error instanceof NodeOperationError) throw error;
-				throw new NodeOperationError(this.getNode(), (error as Error).message, { itemIndex: i });
+				// An answer from ArionPay keeps its HTTP status and body in the n8n error view.
+				if (error instanceof ArionPayApiError && error.status > 0) {
+					throw new NodeApiError(this.getNode(), error.body as JsonObject, { message: error.message, httpCode: String(error.status), itemIndex: i });
+				}
+				// A NodeOperationError is passed on as it is; anything else becomes one.
+				throw new NodeOperationError(this.getNode(), error as Error, { itemIndex: i });
 			}
 		}
 		return [out];

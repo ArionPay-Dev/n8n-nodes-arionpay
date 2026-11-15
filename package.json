@@ -1,7 +1,7 @@
 {
   "name": "n8n-nodes-arionpay",
-  "version": "1.0.1",
-  "description": "ArionPay crypto payments for n8n: create invoices, read them, and start workflows when a payment arrives (signed webhooks). Money goes straight to your own wallet.",
+  "version": "2.0.0",
+  "description": "ArionPay crypto payments for n8n: create and read invoices, and check signed payment webhooks received by n8n's Webhook node. Money goes straight to your own wallet.",
   "keywords": ["n8n-community-node-package", "arionpay", "crypto", "bitcoin", "usdt", "payments"],
   "license": "MIT",
   "homepage": "https://arionpay.com",
@@ -10,7 +10,7 @@
     "url": "git+https://github.com/ArionPay-Dev/n8n-nodes-arionpay.git"
   },
   "bugs": "https://github.com/ArionPay-Dev/n8n-nodes-arionpay/issues",
-  "author": { "name": "ArionPay", "url": "https://arionpay.com" },
+  "author": { "name": "ArionPay", "email": "info@arionpay.com", "url": "https://arionpay.com" },
   "main": "index.js",
   "files": ["dist"],
   "scripts": {
@@ -20,7 +20,7 @@
   "n8n": {
     "n8nNodesApiVersion": 1,
     "credentials": ["dist/credentials/ArionPayApi.credentials.js"],
-    "nodes": ["dist/nodes/ArionPay/ArionPay.node.js", "dist/nodes/ArionPayTrigger/ArionPayTrigger.node.js"]
+    "nodes": ["dist/nodes/ArionPay/ArionPay.node.js"]
   },
   "devDependencies": {
     "n8n-workflow": "*",
